@@ -1,0 +1,183 @@
+
+name: Build Custom Clash Mi Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_id:
+        description: "Android applicationId"
+        required: true
+        default: "com.example.clashmi.custom"
+        type: string
+      app_name:
+        description: "App display name"
+        required: true
+        default: "Clash Mi Custom"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build arm64-v8a APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      APP_ID: ${{ inputs.app_id }}
+      APP_NAME: ${{ inputs.app_name }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.44.0"
+          cache: true
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        run: |
+          sdkmanager \
+            "platforms;android-35" \
+            "build-tools;36.0.0" \
+            "ndk;28.2.13676358"
+
+      - name: Configure Flutter Android project
+        run: |
+          mkdir -p android
+          printf 'flutter.sdk=%s\n' "$FLUTTER_ROOT" > android/local.properties
+          printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" >> android/local.properties
+
+      - name: Apply custom package name and app label
+        env:
+          APP_ID: ${{ inputs.app_id }}
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          from xml.sax.saxutils import escape
+
+          app_id = os.environ["APP_ID"].strip()
+          app_name = os.environ["APP_NAME"].strip()
+
+          if not re.fullmatch(
+              r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+",
+              app_id
+          ):
+              raise SystemExit("Invalid Android applicationId")
+
+          if not app_name:
+              raise SystemExit("App name cannot be empty")
+
+          gradle = Path("android/app/build.gradle.kts")
+          content = gradle.read_text()
+
+          old = 'applicationId = "com.nebula.clashmi"'
+          new = f'applicationId = "{app_id}"'
+
+          if old not in content:
+              raise SystemExit("Original applicationId not found")
+
+          gradle.write_text(content.replace(old, new, 1))
+
+          manifest = Path("android/app/src/main/AndroidManifest.xml")
+          content = manifest.read_text()
+
+          old_label = 'android:label="Clash Mi"'
+          new_label = f'android:label="{escape(app_name)}"'
+
+          if old_label not in content:
+              raise SystemExit("Original app label not found")
+
+          manifest.write_text(content.replace(old_label, new_label, 1))
+          PY
+
+      - name: Apply custom launcher icon
+        run: |
+          test -f branding/icon.png
+          cp branding/icon.png logo-round.png
+          flutter pub get
+          dart run flutter_launcher_icons
+
+      - name: Configure arm64-only build
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("android/app/build.gradle.kts")
+          content = path.read_text()
+
+          content = content.replace(
+              'abiFilters += listOf("armeabi-v7a", "arm64-v8a")',
+              'abiFilters += listOf("arm64-v8a")'
+          )
+
+          content = content.replace(
+              'include("armeabi-v7a", "arm64-v8a")',
+              'include("arm64-v8a")'
+          )
+
+          content = content.replace(
+              'isUniversalApk = true',
+              'isUniversalApk = false'
+          )
+
+          path.write_text(content)
+          PY
+
+      - name: Restore Android signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          test -n "$KEYSTORE_BASE64"
+          test -n "$KEYSTORE_PASSWORD"
+          test -n "$KEY_ALIAS"
+          test -n "$KEY_PASSWORD"
+
+          printf '%s' "$KEYSTORE_BASE64" \
+            | base64 --decode > android/clashmi-release.jks
+
+          {
+            echo "storeFile.release=clashmi-release.jks"
+            echo "storePassword.release=$KEYSTORE_PASSWORD"
+            echo "keyAlias.release=$KEY_ALIAS"
+            echo "keyPassword.release=$KEY_PASSWORD"
+          } > android/key.properties
+
+      - name: Build Android arm64 APK
+        run: |
+          flutter build apk \
+            --release \
+            --target-platform android-arm64 \
+            --split-per-abi
+
+      - name: Verify APK
+        run: |
+          ls -lh build/app/outputs/flutter-apk/
+          test -f build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Clash-Mi-Custom-arm64
+          path: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+          if-no-files-found: error
+          retention-days: 30
